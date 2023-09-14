@@ -30,6 +30,8 @@ typedef struct {
 	int rc;
 	int preset;
 	int encoder_flushing;
+	int slice_max_size;
+	int coder;
 	AVFrame *frame; //tmp frame
 }nvmpiEncodeContext;
 
@@ -130,48 +132,83 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 
 	nvEncParam param={0};
 
-	param.width=avctx->width;
-	param.height=avctx->height;
-	param.bitrate=avctx->bit_rate;
+	param.width = avctx->width;
+	param.height = avctx->height;
+	if (nvmpi_context->profile == FF_PROFILE_UNKNOWN) {
+		switch (avctx->profile) {
+			case AV_PROFILE_H264_BASELINE:
+			case AV_PROFILE_H264_MAIN:
+			case AV_PROFILE_H264_HIGH:
+				param.profile = avctx->profile;
+				break;
+		}
+	} else {
+		param.profile = nvmpi_context->profile;
+	}
+	param.profile = param.profile & ~AV_PROFILE_H264_INTRA;
+
+	param.bitrate = avctx->bit_rate;
+	param.peak_bitrate = avctx->rc_max_rate;
+
+	param.iframe_interval = 250;
+	param.idr_interval = 250;
+	if (avctx->gop_size >= 0) {
+		param.idr_interval = param.iframe_interval = avctx->gop_size;
+	}
+
+	param.fps_n = avctx->framerate.num;
+	param.fps_d = avctx->framerate.den;
+
+	if (avctx->qmin >= 0 && avctx->qmax >= 0) {
+		param.qmin = avctx->qmin;
+		param.qmax = avctx->qmax;
+	}
+
+	if (avctx->max_b_frames >= 0) {
+		param.max_b_frames = avctx->max_b_frames;
+	} else {
+		param.max_b_frames = 3;
+	}
+
+	if (avctx->refs >= 0) {
+		param.refs = avctx->refs;
+	} else {
+		param.refs = 3;
+	}
+
 	param.vbv_buffer_size = avctx->rc_buffer_size;
-	//TODO use rc_initial_buffer_occupancy or ignore?
-	param.mode_vbr=0;
-	param.idr_interval=60;
-	param.iframe_interval=30;
-	param.peak_bitrate=avctx->rc_max_rate;
-	param.fps_n=avctx->framerate.num;
-	param.fps_d=avctx->framerate.den;
-	param.profile=nvmpi_context->profile& ~FF_PROFILE_H264_INTRA;
-	param.level=nvmpi_context->level;
-	param.capture_num=nvmpi_context->num_capture_buffers;
-	param.hw_preset_type=nvmpi_context->preset;
-	param.insert_spspps_idr=(avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER)?0:1;
+	param.capture_num = nvmpi_context->num_capture_buffers;
+
+	if (nvmpi_context->slice_max_size >= 0) {
+		param.slice_length = nvmpi_context->slice_max_size;
+	}
+	param.insert_spspps_idr = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 0 : 1;
+	param.enableLossless = false;
+
+	if (avctx->thread_type) {
+		param.enable_slice_level_encode = avctx->thread_type == FF_THREAD_SLICE;
+	}
+
+	if (nvmpi_context->coder >= 0) {
+		param.disable_cabac = 1 - nvmpi_context->coder;
+	}
+
+	if (nvmpi_context->rc >= 0) {
+		param.mode_vbr = nvmpi_context->rc;
+	} else {
+		param.mode_vbr = 1;
+	}
+
+	param.level = nvmpi_context->level;
+	if (!param.level && avctx->level > 0) {
+		param.level = avctx->level;
+	}
+
+	param.hw_preset_type = nvmpi_context->preset;
 
 	nvmpi_context->frame = av_frame_alloc();
-	if (!nvmpi_context->frame) return AVERROR(ENOMEM);
-
-	if(nvmpi_context->rc==1){
-		param.mode_vbr=1;
-	}
-
-	if(avctx->qmin >= 0 && avctx->qmax >= 0){
-		param.qmin=avctx->qmin;
-		param.qmax=avctx->qmax;
-	}
-
-	if (avctx->refs >= 0){
-		param.refs=avctx->refs;
-
-	}
-
-	if(avctx->max_b_frames > 0 && avctx->max_b_frames < 3){
-		param.max_b_frames=avctx->max_b_frames;
-	}
-
-	if(avctx->gop_size>0){
-		param.idr_interval=param.iframe_interval=avctx->gop_size;
-
-	}
+	if (!nvmpi_context->frame)
+		return AVERROR(ENOMEM);
 
 	//TODO should replace it
 	if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && (avctx->codec->id == AV_CODEC_ID_H264)){
@@ -446,9 +483,9 @@ static const AVCodecDefault defaults[] = {
 	{ "qdiff", "-1" },
 	{ "qblur", "-1" },
 	{ "qcomp", "-1" },
-	{ "g", "50" },
-	{ "bf", "0" },
-	{ "refs", "0" },
+	{ "g", "-1" },
+	{ "bf", "-1" },
+	{ "refs", "-1" },
 	{ NULL },
 };
 
@@ -484,9 +521,9 @@ static const AVOption options[] = {
 	{ "5.0",            "",                     0,              AV_OPT_TYPE_CONST, { .i64 = 50 }, 0, 0,  VE, "level" },
 	{ "5.1",            "",                     0,              AV_OPT_TYPE_CONST, { .i64 = 51 }, 0, 0,  VE, "level" },
 
-	{ "rc",           "Override the preset rate-control",   OFFSET(rc),           AV_OPT_TYPE_INT,   { .i64 = -1 },                                  -1, INT_MAX, VE, "rc" },
-	{ "cbr",          "Constant bitrate mode",              0,                    AV_OPT_TYPE_CONST, { .i64 = 0 },                       0, 0, VE, "rc" },
-	{ "vbr",          "Variable bitrate mode",              0,                    AV_OPT_TYPE_CONST, { .i64 = 1 },                       0, 0, VE, "rc" },
+	{ "rc",           "Override the preset rate-control",   OFFSET(rc),           AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, INT_MAX, VE, "rc" },
+	{ "cbr",          "Constant bitrate mode",              0,                    AV_OPT_TYPE_CONST, { .i64 = 0 },   0, 0, VE, "rc" },
+	{ "vbr",          "Variable bitrate mode",              0,                    AV_OPT_TYPE_CONST, { .i64 = 1 },   0, 0, VE, "rc" },
 
 	{ "preset",          "Set the encoding preset",            OFFSET(preset),       AV_OPT_TYPE_INT,   { .i64 = 3 }, 1, 4, VE, "preset" },
 	{ "default",         "",                                   0,                    AV_OPT_TYPE_CONST, { .i64 = 3 }, 0, 0, VE, "preset" },
@@ -494,6 +531,16 @@ static const AVOption options[] = {
 	{ "medium",          "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 3 },            0, 0, VE, "preset" },
 	{ "fast",            "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 2 },            0, 0, VE, "preset" },
 	{ "ultrafast",       "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 1 },            0, 0, VE, "preset" },
+
+	{ "slice-max-size","Limit the size of each slice in bytes",           OFFSET(slice_max_size),AV_OPT_TYPE_INT,    { .i64 = -1 }, -1, INT_MAX, VE },
+
+	{ "coder",    "Coder type",                                           OFFSET(coder), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, VE, "coder" },
+	{ "default",          NULL, 0, AV_OPT_TYPE_CONST, { .i64 = -1 }, INT_MIN, INT_MAX, VE, "coder" },
+	{ "cavlc",            NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 },  INT_MIN, INT_MAX, VE, "coder" },
+	{ "cabac",            NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 },  INT_MIN, INT_MAX, VE, "coder" },
+	{ "vlc",              NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 },  INT_MIN, INT_MAX, VE, "coder" },
+	{ "ac",               NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 },  INT_MIN, INT_MAX, VE, "coder" },
+
 	{ NULL }
 };
 
